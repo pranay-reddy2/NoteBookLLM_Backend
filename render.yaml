@@ -6,11 +6,11 @@ services:
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: GEMINI_API_KEY
-        sync: false   # Set this manually in Render dashboard
+        sync: false
       - key: ENV
         value: production
       - key: PYTHON_VERSION
-        value: "3.11.0"
+        value: "3.11.9"
     disk:
       name: chroma-storage
       mountPath: /opt/render/project/src/chroma_db
