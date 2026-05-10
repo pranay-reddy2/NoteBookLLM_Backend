@@ -3,14 +3,14 @@ fastapi==0.115.0
 uvicorn[standard]==0.32.0
 python-multipart==0.0.12
 
-# RAG / AI
-langchain==0.3.7
-langchain-community==0.3.7
-chromadb==0.5.23
+# AI / LLM
 google-generativeai==0.8.3
 
-# Embeddings — fastembed 0.5+ supports Python 3.13/3.14
-fastembed==0.5.1
+# Vector Database
+chromadb==0.6.3
+
+# Embeddings — no torch, no numpy conflicts
+fastembed==0.7.4
 
 # PDF Processing
 pdfplumber==0.11.4
@@ -20,4 +20,3 @@ PyPDF2==3.0.1
 python-dotenv==1.0.1
 pydantic==2.10.3
 httpx==0.28.0
-numpy>=1.26.0
