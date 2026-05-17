@@ -1,6 +1,7 @@
 """
 DocMind RAG Application - FastAPI Backend
-Main application entry point with all API endpoints.
+Advanced RAG 2 Pipeline: Query Translation → HyDE → Multi-query Retrieval
+                          → LLM Re-ranking → LLM Judge → Corrective RAG → Generate
 """
 
 import os
@@ -21,45 +22,41 @@ from rag.embedder import generate_embeddings, get_embedding_model
 from rag.retriever import (
     initialize_vector_store,
     store_chunks,
-    retrieve_relevant_chunks,
     get_collection_stats,
     delete_document,
     list_documents,
 )
 from rag.generator import generate_answer
 
-# ── App Setup ─────────────────────────────────────────────────────────────────
+# ── Advanced RAG 2 imports ─────────────────────────────────────────────────────
+from rag.query_processor import process_query_advanced
+from rag.advanced_retriever import multi_query_retrieve
+from rag.reranker import post_retrieval_pipeline
+
+# ── App Setup ──────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="DocMind RAG API",
-    description="Production-quality RAG application API powered by LangChain + ChromaDB + Gemini",
-    version="1.0.0",
+    description="Advanced RAG 2 pipeline: Query Translation + HyDE + Re-ranking + CRAG",
+    version="2.0.0",
 )
-
-# Allow frontend origins (update for production)
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:5173,http://localhost:3000,https://*.vercel.app",
-).split(",")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Ensure directories exist
 UPLOAD_DIR = Path("uploads")
 UPLOAD_DIR.mkdir(exist_ok=True)
 
-# Initialize vector store on startup
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize embedding model and vector store on startup."""
-    print("🚀 Starting DocMind RAG API...")
-    get_embedding_model()   # Pre-load model into memory
+    print("🚀 Starting DocMind RAG API v2 (Advanced RAG)...")
+    get_embedding_model()
     initialize_vector_store()
     print("✅ Vector store initialized")
 
@@ -68,8 +65,17 @@ async def startup_event():
 
 class AskRequest(BaseModel):
     query: str
-    document_ids: Optional[List[str]] = None  # Filter by specific documents
+    document_ids: Optional[List[str]] = None
     top_k: int = 4
+
+    # Advanced RAG 2 toggles — all ON by default
+    use_query_translation: bool = True      # Fix typos, rephrase
+    use_decomposition: bool = True          # Sub-query splitting
+    use_hyde: bool = True                   # HyDE embeddings
+    use_expansion: bool = True             # Multi-query expansion
+    use_reranking: bool = True             # LLM cross-encoder re-ranking
+    use_llm_judge: bool = True             # LLM relevance filtering
+    use_crag: bool = True                  # Corrective RAG
 
 
 class SourceChunk(BaseModel):
@@ -78,13 +84,19 @@ class SourceChunk(BaseModel):
     chunk_id: str
     page_number: Optional[int] = None
     similarity_score: float
+    llm_relevance_score: Optional[float] = None  # NEW: LLM judge score
 
 
 class AskResponse(BaseModel):
     answer: str
     sources: List[SourceChunk]
     query: str
+    translated_query: Optional[str] = None         # NEW
+    sub_queries: Optional[List[str]] = None         # NEW
+    crag_status: Optional[str] = None               # NEW: confident/uncertain/irrelevant
+    confidence_score: Optional[float] = None        # NEW
     processing_time_ms: float
+    pipeline_stats: Optional[dict] = None           # NEW: debug info
 
 
 class UploadResponse(BaseModel):
@@ -101,16 +113,16 @@ class DocumentInfo(BaseModel):
     uploaded_at: Optional[str] = None
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for deployment monitoring."""
     stats = get_collection_stats()
     return {
         "status": "healthy",
         "service": "DocMind RAG API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "rag_version": "Advanced RAG 2 (Query Translation + HyDE + Re-ranking + CRAG)",
         "vector_store": stats,
     }
 
@@ -119,66 +131,43 @@ async def health_check():
 async def upload_document(file: UploadFile = File(...)):
     """
     Upload a PDF or TXT document.
-    
-    Pipeline:
-    1. Save file to disk
-    2. Extract text content
-    3. Chunk text with overlap
-    4. Generate embeddings
-    5. Store in ChromaDB
+    Pipeline: Save → Extract → Chunk → Embed → Store in ChromaDB
     """
-    # Validate file type
-    allowed_types = {
-        "application/pdf": ".pdf",
-        "text/plain": ".txt",
-        "application/octet-stream": None,  # Allow generic binary (some clients send this)
-    }
-    
     filename = file.filename or "document"
     ext = Path(filename).suffix.lower()
-    
+
     if ext not in [".pdf", ".txt"]:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file type '{ext}'. Please upload PDF or TXT files.",
         )
 
-    # Generate unique document ID
     document_id = str(uuid.uuid4())
     save_path = UPLOAD_DIR / f"{document_id}{ext}"
 
     try:
-        # Save file
         content = await file.read()
         if len(content) == 0:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-        if len(content) > 50 * 1024 * 1024:  # 50MB limit
-            raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB.")
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=400, detail="File too large. Maximum 50MB.")
 
         with open(save_path, "wb") as f:
             f.write(content)
 
-        # Extract text
         extracted_text = extract_text_from_file(str(save_path), ext)
         if not extracted_text.strip():
             raise HTTPException(
                 status_code=422,
-                detail="Could not extract text from the document. Ensure it is not scanned/image-only.",
+                detail="Could not extract text. Ensure document is not image-only.",
             )
 
-        # Chunk text
         chunks = chunk_text(extracted_text)
         if not chunks:
-            raise HTTPException(status_code=422, detail="Document produced no usable text chunks.")
+            raise HTTPException(status_code=422, detail="Document produced no usable chunks.")
 
-        # Generate embeddings & store
         embeddings = generate_embeddings([c["text"] for c in chunks])
-        store_chunks(
-            chunks=chunks,
-            embeddings=embeddings,
-            document_id=document_id,
-            filename=filename,
-        )
+        store_chunks(chunks=chunks, embeddings=embeddings, document_id=document_id, filename=filename)
 
         return UploadResponse(
             document_id=document_id,
@@ -190,7 +179,6 @@ async def upload_document(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        # Clean up saved file on error
         if save_path.exists():
             save_path.unlink()
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
@@ -199,43 +187,120 @@ async def upload_document(file: UploadFile = File(...)):
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(request: AskRequest):
     """
-    Ask a question against the uploaded documents.
-    
-    Pipeline:
-    1. Embed the user query
-    2. Semantic similarity search in ChromaDB
-    3. Retrieve top-k relevant chunks
-    4. Inject context into Gemini prompt
-    5. Return grounded answer + sources
+    Advanced RAG 2 Query Pipeline:
+
+    1. Query Translation    → Fix typos, rephrase for clarity
+    2. Sub-query Decomposition → Split complex queries into atomic parts
+    3. HyDE                 → Generate hypothetical doc for better embedding match
+    4. Multi-query Expansion → Generate query variants for higher recall
+    5. Multi-query Retrieval → Retrieve + merge chunks from all search texts
+    6. LLM Re-ranking       → Cross-encoder style scoring of (query, chunk) pairs
+    7. LLM Judge            → Filter irrelevant chunks below threshold
+    8. Corrective RAG       → Decide confident / uncertain / irrelevant
+    9. Generate             → Grounded answer via Gemini with filtered context
     """
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     start_time = time.time()
+    pipeline_stats = {"stages": {}}
 
     try:
-        # Retrieve relevant chunks via semantic search
-        retrieved = retrieve_relevant_chunks(
-            query=request.query,
-            top_k=request.top_k,
+        # ── Stage 1-4: Query Processing ────────────────────────────────────────
+        t0 = time.time()
+
+        if any([request.use_query_translation, request.use_decomposition,
+                request.use_hyde, request.use_expansion]):
+            query_result = process_query_advanced(
+                raw_query=request.query,
+                use_hyde=request.use_hyde,
+                use_expansion=request.use_expansion,
+                use_decomposition=request.use_decomposition,
+            )
+            translated_query = query_result["translated_query"]
+            sub_queries = query_result["sub_queries"]
+            search_texts = query_result["all_search_texts"]
+        else:
+            # All advanced features disabled — basic RAG fallback
+            translated_query = request.query
+            sub_queries = [request.query]
+            search_texts = [request.query]
+
+        pipeline_stats["stages"]["query_processing_ms"] = round((time.time() - t0) * 1000, 1)
+        pipeline_stats["search_texts_count"] = len(search_texts)
+
+        # ── Stage 5: Multi-query Retrieval ─────────────────────────────────────
+        t0 = time.time()
+
+        raw_chunks = multi_query_retrieve(
+            search_texts=search_texts,
+            top_k_per_query=request.top_k,
             document_ids=request.document_ids,
+            max_total_chunks=request.top_k * 3,  # Retrieve more, re-rank down
         )
 
-        if not retrieved:
+        pipeline_stats["stages"]["retrieval_ms"] = round((time.time() - t0) * 1000, 1)
+        pipeline_stats["raw_chunks_retrieved"] = len(raw_chunks)
+
+        if not raw_chunks:
             return AskResponse(
-                answer="I could not find this information in the document. Please upload a relevant document first.",
+                answer="I could not find relevant information. Please upload a relevant document first.",
                 sources=[],
                 query=request.query,
+                translated_query=translated_query,
+                sub_queries=sub_queries,
+                crag_status="irrelevant",
+                confidence_score=0.0,
                 processing_time_ms=round((time.time() - start_time) * 1000, 2),
+                pipeline_stats=pipeline_stats,
             )
 
-        # Generate grounded answer via Gemini
-        answer = generate_answer(
-            query=request.query,
-            retrieved_chunks=retrieved,
+        # ── Stages 6-8: Re-ranking + Judge + CRAG ──────────────────────────────
+        t0 = time.time()
+
+        crag_result = post_retrieval_pipeline(
+            query=translated_query,
+            raw_chunks=raw_chunks,
+            use_reranking=request.use_reranking,
+            use_judge=request.use_llm_judge,
+            use_crag=request.use_crag,
         )
 
-        # Format source chunks for response
+        pipeline_stats["stages"]["rerank_judge_crag_ms"] = round((time.time() - t0) * 1000, 1)
+        pipeline_stats["crag_status"] = crag_result.status
+        pipeline_stats["chunks_after_filtering"] = len(crag_result.accepted_chunks)
+
+        # CRAG says no relevant chunks — return fallback
+        if not crag_result.should_answer() or not crag_result.accepted_chunks:
+            return AskResponse(
+                answer=crag_result.fallback_message or "I could not find relevant information in your documents.",
+                sources=[],
+                query=request.query,
+                translated_query=translated_query,
+                sub_queries=sub_queries,
+                crag_status=crag_result.status,
+                confidence_score=crag_result.confidence_score,
+                processing_time_ms=round((time.time() - start_time) * 1000, 2),
+                pipeline_stats=pipeline_stats,
+            )
+
+        # ── Stage 9: Generate Answer ────────────────────────────────────────────
+        t0 = time.time()
+
+        final_chunks = crag_result.accepted_chunks[:request.top_k]  # Cap for token budget
+
+        # Prepend uncertainty note if CRAG is uncertain
+        prefix = ""
+        if crag_result.status == "uncertain" and crag_result.fallback_message:
+            prefix = crag_result.fallback_message + "\n\n"
+
+        answer = generate_answer(
+            query=translated_query,  # Use translated (cleaner) query
+            retrieved_chunks=final_chunks,
+        )
+
+        pipeline_stats["stages"]["generation_ms"] = round((time.time() - t0) * 1000, 1)
+
         sources = [
             SourceChunk(
                 content=chunk["text"],
@@ -243,15 +308,21 @@ async def ask_question(request: AskRequest):
                 chunk_id=chunk["chunk_id"],
                 page_number=chunk["metadata"].get("page_number"),
                 similarity_score=round(chunk["score"], 4),
+                llm_relevance_score=chunk.get("llm_relevance_score"),
             )
-            for chunk in retrieved
+            for chunk in final_chunks
         ]
 
         return AskResponse(
-            answer=answer,
+            answer=prefix + answer,
             sources=sources,
             query=request.query,
+            translated_query=translated_query if translated_query != request.query else None,
+            sub_queries=sub_queries if len(sub_queries) > 1 else None,
+            crag_status=crag_result.status,
+            confidence_score=round(crag_result.confidence_score, 3),
             processing_time_ms=round((time.time() - start_time) * 1000, 2),
+            pipeline_stats=pipeline_stats,
         )
 
     except Exception as e:
@@ -260,7 +331,6 @@ async def ask_question(request: AskRequest):
 
 @app.get("/documents", response_model=List[DocumentInfo])
 async def get_documents():
-    """List all uploaded documents stored in the vector database."""
     try:
         docs = list_documents()
         return [DocumentInfo(**doc) for doc in docs]
@@ -270,15 +340,12 @@ async def get_documents():
 
 @app.delete("/documents/{document_id}")
 async def remove_document(document_id: str):
-    """Delete a document and its embeddings from the vector store."""
     try:
         deleted_count = delete_document(document_id)
         return {"message": f"Deleted document {document_id} ({deleted_count} chunks removed)."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Entry Point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     uvicorn.run(
