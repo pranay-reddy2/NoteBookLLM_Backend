@@ -1,108 +1,125 @@
 """
 rag/chunker.py
 ──────────────
-Text chunking using a pure-Python RecursiveCharacterSplitter.
-No LangChain dependency — identical logic, zero conflicts.
+Text chunking using LangChain's RecursiveCharacterTextSplitter.
 
 WHY CHUNKING?
-  LLMs have a finite context window. Chunking splits documents into
-  segments that fit inside the window and produce focused embeddings.
+─────────────
+LLMs have a finite context window.  Entire documents (often thousands of
+words) cannot be fed in a single prompt.  Chunking splits the document into
+overlapping segments so:
+
+  1. Each chunk fits inside the LLM's context window.
+  2. Semantically related text stays together.
+  3. The retrieval system can pinpoint the exact passage that answers a query.
 
 WHY OVERLAP?
-  A 100-character overlap duplicates text near chunk boundaries so a
-  sentence split across two chunks is still fully captured in one of them.
+────────────
+Without overlap, a sentence that straddles the boundary of two chunks would
+be split mid-thought.  An overlap of 100 characters ensures that context near
+chunk boundaries is duplicated into the neighbouring chunk, preserving
+semantic continuity and improving retrieval recall.
 
-HOW IT IMPROVES RETRIEVAL:
-  Smaller focused chunks produce more precise embeddings. Semantic search
-  returns the exact passage rather than an entire document.
+HOW CHUNKING IMPROVES RETRIEVAL QUALITY:
+─────────────────────────────────────────
+  - Smaller, focused chunks produce more precise embeddings.
+  - Semantic search returns the exact passage, not the whole document.
+  - Overlap reduces the chance that the answer is cut across a boundary.
 """
 
 from __future__ import annotations
+
 import re
 import logging
 from typing import List, Dict, Any
 
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 logger = logging.getLogger(__name__)
 
-CHUNK_SIZE    = 500
-CHUNK_OVERLAP = 100
-SEPARATORS    = ["\n\n", "\n", ". ", " ", ""]
-PAGE_RE       = re.compile(r"\[PAGE (\d+)\]")
+# ── Configuration ──────────────────────────────────────────────────────────────
 
+CHUNK_SIZE = 500       # Maximum characters per chunk
+CHUNK_OVERLAP = 100    # Characters shared between consecutive chunks
 
-def _split_text(text: str, separators: List[str], chunk_size: int, overlap: int) -> List[str]:
-    """Recursively split text by a hierarchy of separators."""
-    separator = separators[-1]
-    for sep in separators:
-        if sep == "" or sep in text:
-            separator = sep
-            break
-
-    splits = text.split(separator) if separator else list(text)
-
-    chunks: List[str] = []
-    current = ""
-
-    for split in splits:
-        piece = (separator + split) if current else split
-        if len(current) + len(piece) <= chunk_size:
-            current += piece
-        else:
-            if current:
-                chunks.append(current)
-            # If a single split exceeds chunk_size, recurse with next separator
-            if len(split) > chunk_size and len(separators) > 1:
-                sub = _split_text(split, separators[1:], chunk_size, overlap)
-                chunks.extend(sub)
-                current = ""
-            else:
-                # Start new chunk with overlap from end of previous
-                if chunks:
-                    prev = chunks[-1]
-                    current = prev[-overlap:] + separator + split if overlap else split
-                else:
-                    current = split
-
-    if current:
-        chunks.append(current)
-
-    return chunks
+# Page marker pattern inserted by loader.py
+PAGE_MARKER_RE = re.compile(r"\[PAGE (\d+)\]")
 
 
 def chunk_text(text: str) -> List[Dict[str, Any]]:
     """
     Split extracted document text into overlapping chunks.
 
+    Args:
+        text: Raw extracted text (may contain [PAGE N] markers).
+
     Returns:
-        List of dicts with keys: text, chunk_index, page_number.
+        List of dicts, each with:
+          - "text":        chunk content
+          - "chunk_index": sequential index (0-based)
+          - "page_number": best-guess page number (int or None)
     """
     if not text.strip():
         return []
 
-    raw_chunks = _split_text(text, SEPARATORS, CHUNK_SIZE, CHUNK_OVERLAP)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        # Hierarchy of separators: paragraphs → sentences → words → chars
+        separators=["\n\n", "\n", ". ", " ", ""],
+        length_function=len,
+    )
 
-    results: List[Dict[str, Any]] = []
-    for idx, chunk in enumerate(raw_chunks):
-        # Extract page number from [PAGE N] markers
-        match = PAGE_RE.search(chunk)
-        if not match:
-            for prev in reversed(raw_chunks[:idx]):
-                m = PAGE_RE.search(prev)
-                if m:
-                    match = m
-                    break
+    raw_chunks = splitter.split_text(text)
 
-        page_number = int(match.group(1)) if match else None
-        clean = PAGE_RE.sub("", chunk).strip()
+    chunks: List[Dict[str, Any]] = []
+    for idx, chunk_text in enumerate(raw_chunks):
+        page_number = _extract_page_number(chunk_text, text, idx, raw_chunks)
 
-        if not clean:
+        # Strip the [PAGE N] markers from the stored chunk text
+        clean_text = PAGE_MARKER_RE.sub("", chunk_text).strip()
+
+        if not clean_text:
             continue
 
-        results.append({
-            "text":        clean,
-            "chunk_index": idx,
-            "page_number": page_number,
-        })
+        chunks.append(
+            {
+                "text": clean_text,
+                "chunk_index": idx,
+                "page_number": page_number,
+            }
+        )
 
-    logger.info(f"Chunked into {len(results)} pieces (size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
-    return results
+    logger.info(
+        f"Chunking complete: {len(chunks)} chunks from {len(text)} characters "
+        f"(chunk_size={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})"
+    )
+    return chunks
+
+
+def _extract_page_number(
+    chunk: str,
+    full_text: str,
+    chunk_idx: int,
+    all_chunks: List[str],
+) -> int | None:
+    """
+    Attempt to infer the page number for a chunk.
+
+    Strategy:
+      1. Look for a [PAGE N] marker inside the chunk itself.
+      2. Walk backwards through earlier chunks to find the most recent marker.
+      3. Return None if no marker is found.
+    """
+    # Direct match inside current chunk
+    match = PAGE_MARKER_RE.search(chunk)
+    if match:
+        return int(match.group(1))
+
+    # Walk backwards through prior chunks
+    for prev_chunk in reversed(all_chunks[:chunk_idx]):
+        match = PAGE_MARKER_RE.search(prev_chunk)
+        if match:
+            return int(match.group(1))
+
+    return None
