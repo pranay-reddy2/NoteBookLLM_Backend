@@ -3,12 +3,8 @@ fastapi==0.111.0
 uvicorn[standard]==0.29.0
 python-multipart==0.0.9
 
-# ── RAG / AI ───────────────────────────────────────────────────────────────────
-langchain==0.2.6
-langchain-community==0.2.6
+# ── Vector store ───────────────────────────────────────────────────────────────
 chromadb==0.5.3
-sentence-transformers==3.0.1
-google-generativeai==0.7.2
 
 # ── PDF Processing ─────────────────────────────────────────────────────────────
 pdfplumber==0.11.0
@@ -18,8 +14,9 @@ PyPDF2==3.0.1
 python-dotenv==1.0.1
 pydantic==2.7.4
 httpx==0.27.0
-
-# ── ML / Numerics ─────────────────────────────────────────────────────────────
 numpy==1.26.4
-torch==2.3.1
-transformers==4.41.2
+langchain-text-splitters==0.2.2
+
+# Embeddings and LLM calls go over plain HTTPS (Gemini / Groq / OpenRouter),
+# so no provider SDK and no torch are needed at runtime.
+# For EMBEDDING_PROVIDER=local install requirements-local-embeddings.txt too.

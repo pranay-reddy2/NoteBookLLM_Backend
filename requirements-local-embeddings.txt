@@ -1,0 +1,6 @@
+# Only needed when EMBEDDING_PROVIDER=local (on-box MiniLM via sentence-transformers).
+# Adds ~2 GB of dependencies and ~30-90 s to cold start; not for Render free tier.
+-r requirements.txt
+sentence-transformers==3.0.1
+torch==2.3.1
+transformers==4.41.2

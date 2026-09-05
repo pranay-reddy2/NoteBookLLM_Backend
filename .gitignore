@@ -13,3 +13,6 @@ env/
 backend/chroma_db/
 backend/uploads/
 *.sqlite3
+# OneDrive sync-conflict copies and bytecode
+*-pranay*
+__pycache__/

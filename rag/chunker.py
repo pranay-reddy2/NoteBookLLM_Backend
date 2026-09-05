@@ -33,7 +33,6 @@ import re
 import logging
 from typing import List, Dict, Any
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +60,13 @@ def chunk_text(text: str) -> List[Dict[str, Any]]:
     """
     if not text.strip():
         return []
+
+    # Lazy import: langchain_text_splitters is a ~1.5 s import and only the
+    # upload path needs it, so /health never pays for it.
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except ImportError:  # older layout
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,

@@ -4,13 +4,26 @@ services:
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
+      - key: GROQ_API_KEY
+        sync: false   # free key: https://console.groq.com/keys
       - key: GEMINI_API_KEY
-        sync: false   # Set this manually in Render dashboard
+        sync: false   # free key: https://aistudio.google.com/apikey (embeddings + LLM fallback)
+      - key: OPENROUTER_API_KEY
+        sync: false   # optional second LLM fallback (":free" models)
+      - key: EMBEDDING_PROVIDER
+        value: gemini
+      - key: LLM_PROVIDER
+        value: groq
+      - key: LLM_FALLBACK_PROVIDERS
+        value: gemini,openrouter
+      - key: DAILY_REQUEST_CAP
+        value: "200"
       - key: ENV
         value: production
       - key: PYTHON_VERSION
-        value: "3.11.0"
+        value: "3.11.9"
     disk:
       name: chroma-storage
       mountPath: /opt/render/project/src/chroma_db
